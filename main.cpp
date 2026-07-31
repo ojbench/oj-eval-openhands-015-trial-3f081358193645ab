@@ -1,8 +1,7 @@
 #include <algorithm>
-#include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <filesystem>
-#include <fstream>
 #include <iostream>
 #include <string>
 #include <vector>
@@ -10,41 +9,58 @@
 namespace {
 
 constexpr std::uint64_t kBucketCount = 131071;
+constexpr std::size_t kMaxKeyLength = 64;
 constexpr const char *kHashFile = "hash.bin";
 constexpr const char *kDataFile = "data.bin";
 
-struct NodeHeader {
+struct Record {
     std::uint64_t next;
     std::int32_t value;
     std::uint16_t key_len;
     std::uint8_t active;
     std::uint8_t padding;
+    char key[kMaxKeyLength];
 };
 
 class FileStore {
 public:
-    FileStore() { initialize(); }
+    FileStore() {
+        ensure_hash_file();
+        ensure_data_file();
+        hash_ = std::fopen(kHashFile, "r+b");
+        data_ = std::fopen(kDataFile, "r+b");
+    }
+
+    ~FileStore() {
+        if (hash_ != nullptr) {
+            std::fclose(hash_);
+        }
+        if (data_ != nullptr) {
+            std::fclose(data_);
+        }
+    }
 
     void insert(const std::string &key, std::int32_t value) {
         const std::uint64_t bucket = hash_key(key);
         std::uint64_t offset = read_bucket_head(bucket);
         while (offset != 0) {
-            NodeHeader header = read_header(offset);
-            if (header.active && header.value == value && read_key(offset, header.key_len) == key) {
+            const Record record = read_record(offset);
+            if (record.active && record.value == value && key_equals(record, key)) {
                 return;
             }
-            offset = header.next;
+            offset = record.next;
         }
-        NodeHeader header{};
-        header.next = read_bucket_head(bucket);
-        header.value = value;
-        header.key_len = static_cast<std::uint16_t>(key.size());
-        header.active = 1;
-        data_.seekp(0, std::ios::end);
-        const std::uint64_t new_offset = static_cast<std::uint64_t>(data_.tellp());
-        data_.write(reinterpret_cast<const char *>(&header), sizeof(header));
-        data_.write(key.data(), static_cast<std::streamsize>(key.size()));
-        data_.flush();
+
+        Record record{};
+        record.next = read_bucket_head(bucket);
+        record.value = value;
+        record.key_len = static_cast<std::uint16_t>(key.size());
+        record.active = 1;
+        std::copy(key.begin(), key.end(), record.key);
+
+        std::fseek(data_, 0, SEEK_END);
+        const std::uint64_t new_offset = static_cast<std::uint64_t>(std::ftell(data_));
+        std::fwrite(&record, sizeof(record), 1, data_);
         write_bucket_head(bucket, new_offset);
     }
 
@@ -52,34 +68,34 @@ public:
         const std::uint64_t bucket = hash_key(key);
         std::uint64_t offset = read_bucket_head(bucket);
         while (offset != 0) {
-            NodeHeader header = read_header(offset);
-            if (header.active && header.value == value && read_key(offset, header.key_len) == key) {
-                header.active = 0;
-                write_header(offset, header);
+            Record record = read_record(offset);
+            if (record.active && record.value == value && key_equals(record, key)) {
+                record.active = 0;
+                write_record(offset, record);
                 return;
             }
-            offset = header.next;
+            offset = record.next;
         }
     }
 
-    std::vector<std::int32_t> find(const std::string &key) {
+    std::vector<std::int32_t> find(const std::string &key) const {
         const std::uint64_t bucket = hash_key(key);
         std::vector<std::int32_t> values;
         std::uint64_t offset = read_bucket_head(bucket);
         while (offset != 0) {
-            NodeHeader header = read_header(offset);
-            if (header.active && read_key(offset, header.key_len) == key) {
-                values.push_back(header.value);
+            const Record record = read_record(offset);
+            if (record.active && key_equals(record, key)) {
+                values.push_back(record.value);
             }
-            offset = header.next;
+            offset = record.next;
         }
         std::sort(values.begin(), values.end());
         return values;
     }
 
 private:
-    std::fstream hash_;
-    std::fstream data_;
+    FILE *hash_ = nullptr;
+    FILE *data_ = nullptr;
 
     static std::uint64_t hash_key(const std::string &key) {
         std::uint64_t hash = 1469598103934665603ull;
@@ -90,78 +106,53 @@ private:
         return hash % kBucketCount;
     }
 
-    static std::streamoff active_offset(std::uint64_t node_offset) {
-        return static_cast<std::streamoff>(node_offset + offsetof(NodeHeader, active));
+    static bool key_equals(const Record &record, const std::string &key) {
+        return record.key_len == key.size() && std::char_traits<char>::compare(record.key, key.data(), record.key_len) == 0;
     }
 
-    static std::streamoff key_offset(std::uint64_t node_offset) {
-        return static_cast<std::streamoff>(node_offset + sizeof(NodeHeader));
-    }
-
-    void initialize() {
-        ensure_hash_file();
-        ensure_data_file();
-        hash_.open(kHashFile, std::ios::in | std::ios::out | std::ios::binary);
-        data_.open(kDataFile, std::ios::in | std::ios::out | std::ios::binary);
-    }
-
-    void ensure_hash_file() {
+    static void ensure_hash_file() {
         if (std::filesystem::exists(kHashFile)) {
             return;
         }
-        std::ofstream out(kHashFile, std::ios::binary);
+        FILE *file = std::fopen(kHashFile, "wb");
         std::uint64_t zero = 0;
         for (std::uint64_t i = 0; i < kBucketCount; ++i) {
-            out.write(reinterpret_cast<const char *>(&zero), sizeof(zero));
+            std::fwrite(&zero, sizeof(zero), 1, file);
+        }
+        std::fclose(file);
+    }
+
+    static void ensure_data_file() {
+        if (!std::filesystem::exists(kDataFile) || std::filesystem::file_size(kDataFile) == 0) {
+            FILE *file = std::fopen(kDataFile, "wb");
+            const char sentinel = '\0';
+            std::fwrite(&sentinel, 1, 1, file);
+            std::fclose(file);
         }
     }
 
-    void ensure_data_file() {
-        if (!std::filesystem::exists(kDataFile)) {
-            std::ofstream out(kDataFile, std::ios::binary);
-            const char sentinel = '\0';
-            out.write(&sentinel, 1);
-            return;
-        }
-        const auto size = std::filesystem::file_size(kDataFile);
-        if (size == 0) {
-            std::ofstream out(kDataFile, std::ios::binary | std::ios::trunc);
-            const char sentinel = '\0';
-            out.write(&sentinel, 1);
-        }
-    }
-
-    std::uint64_t read_bucket_head(std::uint64_t bucket) {
+    std::uint64_t read_bucket_head(std::uint64_t bucket) const {
         std::uint64_t head = 0;
-        hash_.seekg(static_cast<std::streamoff>(bucket * sizeof(head)));
-        hash_.read(reinterpret_cast<char *>(&head), sizeof(head));
+        std::fseek(hash_, static_cast<long>(bucket * sizeof(head)), SEEK_SET);
+        std::fread(&head, sizeof(head), 1, hash_);
         return head;
     }
 
     void write_bucket_head(std::uint64_t bucket, std::uint64_t head) {
-        hash_.seekp(static_cast<std::streamoff>(bucket * sizeof(head)));
-        hash_.write(reinterpret_cast<const char *>(&head), sizeof(head));
-        hash_.flush();
+        std::fseek(hash_, static_cast<long>(bucket * sizeof(head)), SEEK_SET);
+        std::fwrite(&head, sizeof(head), 1, hash_);
     }
 
-    NodeHeader read_header(std::uint64_t offset) {
-        NodeHeader header{};
-        data_.seekg(static_cast<std::streamoff>(offset));
-        data_.read(reinterpret_cast<char *>(&header), sizeof(header));
-        return header;
+    Record read_record(std::uint64_t offset) const {
+        Record record{};
+        std::fseek(data_, static_cast<long>(offset), SEEK_SET);
+        std::fread(&record, sizeof(record), 1, data_);
+        return record;
     }
 
-    void write_header(std::uint64_t offset, const NodeHeader &header) {
-        data_.seekp(static_cast<std::streamoff>(offset));
-        data_.write(reinterpret_cast<const char *>(&header), sizeof(header));
-        data_.flush();
-    }
-
-    std::string read_key(std::uint64_t offset, std::uint16_t length) {
-        std::string key(length, '\0');
-        data_.seekg(key_offset(offset));
-        data_.read(key.data(), static_cast<std::streamsize>(length));
-        return key;
+    void write_record(std::uint64_t offset, const Record &record) {
+        std::fseek(data_, static_cast<long>(offset), SEEK_SET);
+        std::fwrite(&record, sizeof(record), 1, data_);
     }
 };
 
@@ -186,7 +177,7 @@ int main() {
             int value = 0;
             std::cin >> value;
             store.erase(key, value);
-        } else if (command == "find") {
+        } else {
             const auto values = store.find(key);
             if (values.empty()) {
                 std::cout << "null\n";
