@@ -8,13 +8,13 @@
 
 namespace {
 
-constexpr std::uint64_t kBucketCount = 131071;
+constexpr std::uint32_t kBucketCount = 524287;
 constexpr std::size_t kMaxKeyLength = 64;
 constexpr const char *kHashFile = "hash.bin";
 constexpr const char *kDataFile = "data.bin";
 
 struct Record {
-    std::uint64_t next;
+    std::uint32_t next;
     std::int32_t value;
     std::uint16_t key_len;
     std::uint8_t active;
@@ -24,25 +24,23 @@ struct Record {
 
 class FileStore {
 public:
-    FileStore() {
+    FileStore() : heads_(kBucketCount, 0) {
         ensure_hash_file();
         ensure_data_file();
-        hash_ = std::fopen(kHashFile, "r+b");
+        load_heads();
         data_ = std::fopen(kDataFile, "r+b");
     }
 
     ~FileStore() {
-        if (hash_ != nullptr) {
-            std::fclose(hash_);
-        }
+        flush_heads();
         if (data_ != nullptr) {
             std::fclose(data_);
         }
     }
 
     void insert(const std::string &key, std::int32_t value) {
-        const std::uint64_t bucket = hash_key(key);
-        std::uint64_t offset = read_bucket_head(bucket);
+        const std::uint32_t bucket = hash_key(key);
+        std::uint32_t offset = heads_[bucket];
         while (offset != 0) {
             const Record record = read_record(offset);
             if (record.active && record.value == value && key_equals(record, key)) {
@@ -52,21 +50,21 @@ public:
         }
 
         Record record{};
-        record.next = read_bucket_head(bucket);
+        record.next = heads_[bucket];
         record.value = value;
         record.key_len = static_cast<std::uint16_t>(key.size());
         record.active = 1;
         std::copy(key.begin(), key.end(), record.key);
 
         std::fseek(data_, 0, SEEK_END);
-        const std::uint64_t new_offset = static_cast<std::uint64_t>(std::ftell(data_));
+        const auto new_offset = static_cast<std::uint32_t>(std::ftell(data_));
         std::fwrite(&record, sizeof(record), 1, data_);
-        write_bucket_head(bucket, new_offset);
+        heads_[bucket] = new_offset;
     }
 
     void erase(const std::string &key, std::int32_t value) {
-        const std::uint64_t bucket = hash_key(key);
-        std::uint64_t offset = read_bucket_head(bucket);
+        const std::uint32_t bucket = hash_key(key);
+        std::uint32_t offset = heads_[bucket];
         while (offset != 0) {
             Record record = read_record(offset);
             if (record.active && record.value == value && key_equals(record, key)) {
@@ -79,9 +77,9 @@ public:
     }
 
     std::vector<std::int32_t> find(const std::string &key) const {
-        const std::uint64_t bucket = hash_key(key);
+        const std::uint32_t bucket = hash_key(key);
         std::vector<std::int32_t> values;
-        std::uint64_t offset = read_bucket_head(bucket);
+        std::uint32_t offset = heads_[bucket];
         while (offset != 0) {
             const Record record = read_record(offset);
             if (record.active && key_equals(record, key)) {
@@ -94,16 +92,16 @@ public:
     }
 
 private:
-    FILE *hash_ = nullptr;
+    std::vector<std::uint32_t> heads_;
     FILE *data_ = nullptr;
 
-    static std::uint64_t hash_key(const std::string &key) {
+    static std::uint32_t hash_key(const std::string &key) {
         std::uint64_t hash = 1469598103934665603ull;
         for (unsigned char ch : key) {
             hash ^= ch;
             hash *= 1099511628211ull;
         }
-        return hash % kBucketCount;
+        return static_cast<std::uint32_t>(hash % kBucketCount);
     }
 
     static bool key_equals(const Record &record, const std::string &key) {
@@ -111,12 +109,13 @@ private:
     }
 
     static void ensure_hash_file() {
-        if (std::filesystem::exists(kHashFile)) {
+        const std::uintmax_t expected = static_cast<std::uintmax_t>(kBucketCount) * sizeof(std::uint32_t);
+        if (std::filesystem::exists(kHashFile) && std::filesystem::file_size(kHashFile) == expected) {
             return;
         }
         FILE *file = std::fopen(kHashFile, "wb");
-        std::uint64_t zero = 0;
-        for (std::uint64_t i = 0; i < kBucketCount; ++i) {
+        std::uint32_t zero = 0;
+        for (std::uint32_t i = 0; i < kBucketCount; ++i) {
             std::fwrite(&zero, sizeof(zero), 1, file);
         }
         std::fclose(file);
@@ -131,26 +130,26 @@ private:
         }
     }
 
-    std::uint64_t read_bucket_head(std::uint64_t bucket) const {
-        std::uint64_t head = 0;
-        std::fseek(hash_, static_cast<long>(bucket * sizeof(head)), SEEK_SET);
-        std::fread(&head, sizeof(head), 1, hash_);
-        return head;
+    void load_heads() {
+        FILE *file = std::fopen(kHashFile, "rb");
+        std::fread(heads_.data(), sizeof(std::uint32_t), heads_.size(), file);
+        std::fclose(file);
     }
 
-    void write_bucket_head(std::uint64_t bucket, std::uint64_t head) {
-        std::fseek(hash_, static_cast<long>(bucket * sizeof(head)), SEEK_SET);
-        std::fwrite(&head, sizeof(head), 1, hash_);
+    void flush_heads() const {
+        FILE *file = std::fopen(kHashFile, "wb");
+        std::fwrite(heads_.data(), sizeof(std::uint32_t), heads_.size(), file);
+        std::fclose(file);
     }
 
-    Record read_record(std::uint64_t offset) const {
+    Record read_record(std::uint32_t offset) const {
         Record record{};
         std::fseek(data_, static_cast<long>(offset), SEEK_SET);
         std::fread(&record, sizeof(record), 1, data_);
         return record;
     }
 
-    void write_record(std::uint64_t offset, const Record &record) {
+    void write_record(std::uint32_t offset, const Record &record) {
         std::fseek(data_, static_cast<long>(offset), SEEK_SET);
         std::fwrite(&record, sizeof(record), 1, data_);
     }
