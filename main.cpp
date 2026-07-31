@@ -117,10 +117,18 @@ private:
     }
 
     void ensure_data_file() {
-        if (std::filesystem::exists(kDataFile)) {
+        if (!std::filesystem::exists(kDataFile)) {
+            std::ofstream out(kDataFile, std::ios::binary);
+            const char sentinel = '\0';
+            out.write(&sentinel, 1);
             return;
         }
-        std::ofstream out(kDataFile, std::ios::binary);
+        const auto size = std::filesystem::file_size(kDataFile);
+        if (size == 0) {
+            std::ofstream out(kDataFile, std::ios::binary | std::ios::trunc);
+            const char sentinel = '\0';
+            out.write(&sentinel, 1);
+        }
     }
 
     std::uint64_t read_bucket_head(std::uint64_t bucket) {
