@@ -8,7 +8,7 @@
 
 namespace {
 
-constexpr std::uint32_t kBucketCount = 524287;
+constexpr std::uint32_t kBucketCount = 262147;
 constexpr std::size_t kMaxKeyLength = 64;
 constexpr const char *kHashFile = "hash.bin";
 constexpr const char *kDataFile = "data.bin";
